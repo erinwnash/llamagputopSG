@@ -12,6 +12,7 @@ It is highly portable. It discovers the hardware at runtime, so it runs on any L
 Copyright 2026 XscannedX <xscannedx@gmail.com>. MIT License.
 """
 import glob
+import json
 import math
 import os
 import re
@@ -1991,7 +1992,105 @@ _probes = {}            # port -> LlamaProbe, reused across ticks and pruned whe
 _model_ports = {}       # port -> last model seen, to reset that server's median on a swap
 _last_pp = {}           # port -> last prefill speed recorded, so only fresh prefills are logged
 _port_seen = {}         # port -> time a live server was last seen (survives brief restarts)
-_session = {"start": None, "t": None, "energy_j": 0.0}   # cumulative energy since launch
+_session = {"start": None, "t": None, "energy_j": 0.0, "cost_sgd": 0.0}   # since launch
+
+# Electricity price in SGD per kWh. The fallback is the SP Group household tariff for
+# 1 Oct - 31 Dec 2026 (28.59 c/kWh before GST, 31.16 c/kWh with 9% GST, which is what a
+# household pays). SP revises it quarterly, so a background thread re-reads the published
+# figure from SP Group's tariff page at launch and then hourly. Setting
+# LLAMAGPUTOP_RATE_SGD_KWH pins the rate and turns the polling off.
+_FALLBACK_RATE = 0.3116
+_RATE_URL = "https://www.spgroup.com.sg/our-services/utilities/tariff-information"
+_RATE_POLL_S = 3600
+_tariff = {"sgd_kwh": _FALLBACK_RATE, "source": "fallback", "checked": None}
+# GST-inclusive electricity figure: the page lists "<h4>31.16 cents/kWh</h4>", then the
+# pre-GST figure in the caption that names the ELECTRICITY TARIFF (the gas tariff follows).
+_RATE_RE = re.compile(r'([0-9]+(?:\.[0-9]+)?) cents/kWh</h4>(?:(?!</h4>).){0,300}?'
+                      r'cents/kWh \(w/o GST\)<br/>ELECTRICITY TARIFF', re.S)
+
+
+def _fetch_rate():
+    """SGD/kWh incl. GST from SP Group's tariff page, or None on any failure or an
+    implausible figure (the page layout is not an API, so be suspicious of what it gives)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(_RATE_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            m = _RATE_RE.search(r.read().decode("utf-8", "replace"))
+        v = float(m.group(1)) / 100.0 if m else None
+    except Exception:
+        return None
+    return v if v is not None and 0.05 <= v <= 1.0 else None
+
+
+def _rate_poller():
+    while True:
+        v = _fetch_rate()
+        if v is not None:
+            _tariff.update(sgd_kwh=v, source="spgroup.com.sg", checked=time.time())
+        time.sleep(_RATE_POLL_S)
+
+
+def _start_rate_poller():
+    try:
+        pinned = float(os.environ.get("LLAMAGPUTOP_RATE_SGD_KWH", ""))
+    except ValueError:
+        pinned = None
+    if pinned and pinned > 0:
+        _tariff.update(sgd_kwh=pinned, source="env LLAMAGPUTOP_RATE_SGD_KWH")
+        return
+    threading.Thread(target=_rate_poller, daemon=True).start()
+
+
+# Energy log: one JSON file, one entry per session id, rewritten IN PLACE every
+# _LOG_EVERY_S seconds (and once more on exit) so a session's totals grow in its own
+# entry instead of the file gaining a line per update.
+_LOG_EVERY_S = 600
+_LOG_PATH = os.environ.get("LLAMAGPUTOP_LOG") or os.path.join(
+    os.path.expanduser("~"), ".llamagputop", "energy_log.json")
+_log_state = {"id": None, "last": 0.0}
+
+
+def _log_energy(force=False):
+    if _session["start"] is None:
+        return
+    now = time.monotonic()
+    if not force and now - _log_state["last"] < _LOG_EVERY_S:
+        return
+    _log_state["last"] = now
+    if _log_state["id"] is None:
+        _log_state["id"] = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        _log_state["start_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    entry = {
+        "start": _log_state["start_iso"],
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "duration_s": round(now - _session["start"]),
+        "energy_wh": round(_session["energy_j"] / 3600.0, 3),
+        "cost_sgd": round(_session["cost_sgd"], 4),
+        "rate_sgd_kwh": round(_tariff["sgd_kwh"], 4),
+        "rate_source": _tariff["source"],
+    }
+    try:
+        try:
+            with open(_LOG_PATH, encoding="utf-8") as f:
+                doc = json.load(f)
+            sessions = doc["sessions"]
+            if not isinstance(sessions, dict):
+                raise ValueError
+        except (OSError, ValueError, KeyError, TypeError):
+            sessions = {}
+        sessions[_log_state["id"]] = entry
+        doc = {"currency": "SGD",
+               "total_energy_wh": round(sum(e.get("energy_wh", 0) for e in sessions.values()), 3),
+               "total_cost_sgd": round(sum(e.get("cost_sgd", 0) for e in sessions.values()), 4),
+               "sessions": sessions}
+        os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+        tmp = f"{_LOG_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2)
+        os.replace(tmp, _LOG_PATH)
+    except OSError:
+        pass                        # a log that cannot be written must never stop the monitor
 
 
 def record(key, value):
@@ -2395,7 +2494,9 @@ def _power_rows(gpus_data, cpu, llamas, width):
         wh = _session["energy_j"] / 3600.0
         etxt = f"{wh / 1000:.2f} kWh" if wh >= 1000 else f"{wh:.1f} Wh"
         line += [("session ", DIM), (_fmt_dur(time.monotonic() - _session["start"]), 0),
-                 ("  energy used ", DIM), (etxt, curses.A_BOLD)]
+                 ("  energy used ", DIM), (etxt, curses.A_BOLD),
+                 ("  energy cost total ", DIM),
+                 (f"S${_session['cost_sgd']:.4f}", curses.A_BOLD)]
     sum_tg = sum((d.get("tg") or 0) for d in (llamas or []) if d.get("alive"))
     if sum_tg > 0 and total > 0:
         eff = sum_tg / (total / 1000.0)                # t/s per kW  ==  tokens/kJ
@@ -2404,8 +2505,8 @@ def _power_rows(gpus_data, cpu, llamas, width):
         # whole-system efficiency: Every server's tokens over the total system draw, as
         # opposed to the per-session tok/kJ shown in the llama panel. If a component's meter
         # could not be read the total is short by it, so say so instead of overstating.
-        line += [("system efficiency ", DIM), (f"{eff:.0f} t/s per kW", OK),
-                 (f"  ({sum_tg:.1f} t/s / {total:.0f} W total", DIM)]
+        line += [("sys-eff ", DIM), (f"{eff:.0f} t/s per kW", OK),
+                 (f"  ({sum_tg:.1f} t/s / {total:.0f} W tot", DIM)]
         if missing:
             line.append((" · excludes " + ", ".join(missing), WARN))
         line.append((")", DIM))
@@ -2983,8 +3084,11 @@ def _collect(gpus, explicit_port=None, lfeed=None):
     if _session["start"] is None:
         _session["start"] = now
     if _session["t"] is not None:
-        _session["energy_j"] += total_w * (now - _session["t"])
+        _dj = total_w * (now - _session["t"])
+        _session["energy_j"] += _dj
+        _session["cost_sgd"] += _dj / 3.6e6 * _tariff["sgd_kwh"]   # priced at the rate of the day
     _session["t"] = now
+    _log_energy()
     procs = llama_processes() if llamas else []
     cfgs = {}
     for d in llamas:
@@ -3255,6 +3359,7 @@ def main():
         print("optional helpers used when present: lspci, intel_gpu_top, nvtop, nvidia-smi.")
         return
     port = next((a for a in argv if a.isdigit()), None)
+    _start_rate_poller()
     gpus, feeds = discover_gpus()
     if "--probe" in argv:
         probe()
@@ -3275,11 +3380,15 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
+            _log_energy(force=True)
             for f in feeds.values():
                 f.stop = True
         return
     _maybe_enable_rapl()
-    curses.wrapper(_tui, gpus, feeds, port)
+    try:
+        curses.wrapper(_tui, gpus, feeds, port)
+    finally:
+        _log_energy(force=True)
 
 
 if __name__ == "__main__":
